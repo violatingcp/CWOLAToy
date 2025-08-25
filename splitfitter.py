@@ -141,9 +141,10 @@ class fitGausDijet():
         self.model_par2['par0'].vary = True
         self.model_par2['par1'].vary = True
         self.model_par2['par2'].vary = True
-        self.model_par2['par3'].vary = False
+        self.model_par2['par3'].vary = True
         self.model_par1['par1'].vary = True
-        self.model_par1['par3'].vary = False
+        self.model_par1['par2'].vary = True
+        self.model_par1['par3'].vary = True
         self.model_par1['par5'].vary = False
         self.model_par1['par6'].vary = False
 
@@ -192,7 +193,7 @@ class fitGausLin():
         self.model_fit2 = lmfit.Model(self.funcBkg_np)
         self.model_par1 = self.model_fit1.make_params(par0=0.1,par1=0.1, par2=0.,par3=0.5,par4=0.)
         self.model_par2 = self.model_fit2.make_params(par0=0.1,par1=0.0)        
-        self.model_par1['par1'].set(min=0)   
+        self.model_par1['par1'].vary  = False
         if iNFreePars < 3:
             self.model_par1['par2'].vary = False
         if iNFreePars < 3:
@@ -234,8 +235,61 @@ class fitGausLin():
         else:
             results=torch.tensor((0.,0.,0.,0.,0.))
             result=chisqr=0
-        results=results.reshape((1,5))
+        #results=results.reshape((1,5))
         return results,result,chisqr
+
+
+class fitGausBern():
+    def __init__(self, iNFreePars=2):
+        self.model_fit1 = lmfit.Model(self.funcSig_np)
+        self.model_fit2 = lmfit.Model(self.funcBkg_np)
+        self.model_par1 = self.model_fit1.make_params(par0=0.1,par1=50.0, par2=125., par3=2.5,par4=0.5,par5=0.)
+        self.model_par2 = self.model_fit2.make_params(par0=0.1,par1=0.0, par2=0.0)        
+        self.model_par1['par1'].set(min=0)
+        if iNFreePars < 3:
+            self.model_par1['par2'].vary = False
+        if iNFreePars < 3:
+            self.model_par1['par3'].vary = False
+        
+    #Fit functions
+    def funcSig(self,x,pars):#0,par1,par2,par3):
+        val=-1*((x-pars[2])/pars[3])**2
+        prob=torch.exp(val)
+        return pars[1]*prob + pars[0]   + pars[4]*x + pars[5]*(x**2)
+
+    def funcSig_np(self,x,par0,par1,par2,par3,par4,par5):
+        val=-1*((x-par2)/par3)**2
+        prob=np.exp(val)
+        return par1*prob + par0 + par4*x + par5*(x**2)   
+
+    def funcBkg_np(self,x,par0,par1,par2):
+        return par0+par1*x+par2*(x**2)
+
+    def funcBkg(self,x,pars):
+        return pars[0]+pars[1]*x+pars[2]*(x**2)
+
+    def fitSig(self,xtmp,ytmp,yerr):
+        if np.sum(ytmp) > 0:
+            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
+            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,result.params['par4'].value,result.params['par5'].value)))
+            chisqr=result.chisqr
+        else:
+            results=torch.tensor((0.,0.,0.,0.,0.,0.))
+            result=chisqr=0
+        results=results.reshape((1,6))
+        return results,result,chisqr
+
+    def fitBkg(self,xtmp,ytmp,yerr):
+        if np.sum(ytmp) > 0:
+            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=False)
+            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,0.,0.,0.)))
+            chisqr=result.chisqr
+        else:
+            results=torch.tensor((0.,0.,0.,0.,0.,0.))
+            result=chisqr=0
+        results=results.reshape((1,6))
+        return results,result,chisqr
+
 
 class simple_MLPFit_lmfit(torch.nn.Module):
     def __init__(self,in_data,input_size,out_channels=1,act_out=False,nhidden=32,batch_size=20000,n_epochs=100,n_bins=40,fit_opt=1,bkg_loss=0.01,iFitPFunc=fitGausFlat(),iFitFFunc=fitGausFlat(),lambScale=4.0,bkgPressure=True,massDeco=0,mc_data=0,deco_opt=4,k_fold=1,lambvar=0.,iOTLossDiff=100.):
@@ -249,16 +303,16 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         for p in range(k_fold):
             pModel_disc = nn.Sequential(
                 nn.Linear(input_size, nhidden),
-                nn.ReLU(),
+                nn.SiLU(),
                 nn.Linear(nhidden, nhidden),
-                nn.ReLU(),
+                nn.SiLU(),
                 nn.Linear(nhidden, nhidden),
-                nn.ReLU(),
+                nn.SiLU(),
                 nn.Linear(nhidden, out_channels),
             )
             pModel_disc.apply(self.init_weights)
             self.model_disc.append(pModel_disc)
-            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.001))#,weight_decay=0.01))
+            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.001,weight_decay=0.01))
             self.sched.append(torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
             split_size.append(len(in_data)//k_fold)
         self.output     = torch.nn.Sigmoid()
@@ -273,8 +327,8 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         self.fitPFunc   = iFitPFunc
         self.fitFFunc   = iFitFFunc
         self.nbins      = n_bins
-        self.xmin       = 2700.#-3.0
-        self.xmax       = 5200.#3.0 
+        self.xmin       = 90
+        self.xmax       = 160
         self.delta      = (self.xmax - self.xmin) / self.nbins
         self.BIN_Table  = torch.arange(start=0, end=self.nbins+1, step=1) * self.delta + self.xmin
         self.h_r        = 0.5*(self.BIN_Table[1:] + self.BIN_Table[:-1])
@@ -699,7 +753,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             if self.stop:
                 break
            # iSched.step()
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 print('Epoch: {} LOSS train: {} Pars 1: {} - 2: {} deco: {}'.format(epoch,loss_train,loss_fit1,loss_fit2,loss_deco))
 
     def train(self,iNEpoch=0):
@@ -870,21 +924,30 @@ def plotCheck(iModel,iOpt=1):
     result2.plot()
     plt.show()
 
-def plotPerf(iSig,iBkg, iModel,iOpt=1):
+def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
     lN=iSig.shape[1]-1
     output_sig_disc=iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN))
     output_bkg_disc=iModel.forward_disc(iBkg[:,:-1].reshape(len(iBkg),lN))
-
-    xvals=torch.cat((iSig[:,:-1],iBkg[:,:-1]))
-    input=torch.cat((iSig[:,-1],iBkg[:,-1]))
-    output_disc=torch.cat((output_sig_disc,output_bkg_disc))
+    output_sig_disc = torch.nan_to_num(output_sig_disc, nan=0.0, posinf=0.0, neginf=0.0)
+    output_bkg_disc = torch.nan_to_num(output_bkg_disc, nan=0.0, posinf=0.0, neginf=0.0)
+    if iNS > 0:
+        lSRand=np.random.choice(iSig.shape[0],iNS,replace=False)
+        lBRand=np.random.choice(iBkg.shape[0],iNB,replace=False)
+        osdisc=output_sig_disc[lSRand]
+        obdisc=output_bkg_disc[lBRand]
+        input=torch.cat((iSig[lSRand,-1],iBkg[lBRand,-1]))
+        output_disc=torch.cat((osdisc,obdisc))
+    else:
+        input=torch.cat((iSig[:,-1],iBkg[:,-1]))
+        output_disc=torch.cat((output_sig_disc,output_bkg_disc))
 
     _,bins,_=plt.hist(output_sig_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='sig')
     plt.hist(output_bkg_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='bkg',bins=bins)
     plt.legend()
     plt.show()
     
-    if iOpt == 0 or iOpt == 1: 
+    if iOpt == 0 or iOpt == 1:
+        #print(output_disc,torch.round(output_disc))
         xpars,result1,chi2=iModel.forward_fit(output_disc,input,iModel.fitPFunc.fitSig)
         result1.plot()
     elif iOpt == 2: 
@@ -894,6 +957,7 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1):
     print("Pass Significance:",iModel.forward_sig(output_disc,input.detach()))
 
     if iOpt ==1:
+        #xpars,result2,chi2=iModel.forward_fit(torch.round(1.-output_disc),input,iModel.fitFFunc.fitSig)
         xpars,result2,chi2=iModel.forward_fit(1.-output_disc,input,iModel.fitFFunc.fitSig)
         result2.plot()
         print("Fail Significance:",iModel.forward_sig(1.-output_disc,input.detach()))
@@ -907,4 +971,84 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1):
         xpars,result2,chi2=iModel.forward_fit(output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
         result2.plot()
         print("Bkg Significance:",iModel.forward_sig(output_bkg_disc,input_bkg.detach()))
+    plt.show()
+
+from sklearn.metrics import roc_curve, auc
+
+
+def plotROC(iSig,iBkg, iModel,iOpt=1):
+    lN=iSig.shape[1]-1
+    output_sig_disc=iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN)).detach().numpy()
+    output_bkg_disc=iModel.forward_disc(iBkg[:,:-1].reshape(len(iBkg),lN)).detach().numpy()
+    output_disc=np.concatenate((output_sig_disc,output_bkg_disc))
+    output_label=torch.cat((torch.ones(len(output_sig_disc)),torch.zeros(len(output_bkg_disc))))    
+    fpr, tpr, thresholds = roc_curve(output_label, output_disc)
+    roc_auc = auc(fpr, tpr)
+    
+    # Plot ROC curve
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, tpr, color="blue", lw=2, label=f"ROC curve (AUC = {roc_auc:.3f})")
+    plt.plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--")  # diagonal line
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend(loc="lower right")
+    plt.show()
+
+import numpy as np
+from scipy.stats import chi2, norm
+
+def fisher_combine_zscores(zscores):
+    zscores = np.array(zscores)
+    
+    # Convert Z-scores to one-sided p-values
+    pvalues = 1 - norm.cdf(zscores)
+    
+    # Fisher's method
+    X = -2 * np.sum(np.log(pvalues))
+    df = 2 * len(pvalues)
+    p_combined = 1 - chi2.cdf(X, df)
+    
+    # Convert back to Z-score (one-sided)
+    z_combined = norm.isf(p_combined)  # isf = inverse survival function = Φ⁻¹(1-p)
+    
+    return p_combined, z_combined
+
+
+
+
+def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=500):
+    lN=iSig.shape[1]-1
+    output_sig_disc=iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN))
+    output_bkg_disc=iModel.forward_disc(iBkg[:,:-1].reshape(len(iBkg),lN))
+
+    lSigs=[]
+    lBkgs=[]
+    for pToy in range(iNToys):
+          lSRand=np.random.choice(iSig.shape[0],iNS,replace=False)
+          lBRand=np.random.choice(iBkg.shape[0],iNB,replace=False)
+          osdisc=output_sig_disc[lSRand]
+          obdisc=output_bkg_disc[lBRand]
+          inputs=torch.cat((iSig[lSRand,-1],iBkg[lBRand,-1]))
+          inputs_bkg=iBkg[lBRand,-1]
+          output_disc=torch.cat((osdisc,obdisc))
+          lSigP=np.sqrt(iModel.forward_sig(output_disc,inputs.detach()))
+          lSigF=np.sqrt(iModel.forward_sig(1.-output_disc,inputs.detach()))
+          lSigT=fisher_combine_zscores([lSigP,lSigF])
+          lBSig=np.sqrt(iModel.forward_sig(obdisc,inputs_bkg.detach()))
+          lSigs.append(lSigP)
+          lBkgs.append(lBSig)
+
+    lSigs=np.array(lSigs)
+    lBkgs=np.array(lBkgs)
+    lNSigs=lSigs[np.isfinite(lSigs)]
+    lNBkgs=lBkgs[np.isfinite(lBkgs)]
+    bins=np.linspace(0,5,40)
+    plt.hist(lNSigs,density=True,alpha=0.5,label='sig',bins=bins)
+    plt.hist(np.array(lNBkgs),density=True,alpha=0.5,label='bkg',bins=bins)
+    plt.legend()
+    lNFalse=len(lNBkgs[lNBkgs > np.median(lNSigs)])
+    pvalue=lNFalse/iNToys
+    print("Z-score:",norm.isf(pvalue),"p-value:",pvalue)
     plt.show()
