@@ -346,6 +346,16 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         self.stop             = False
         self.otlossdiff       = iOTLossDiff
 
+    def reloadData(self,iData):
+        split_size=[]
+        for p in range(self.k_fold):
+            split_size.append(len(iData)//self.k_fold)
+        sub_data = random_split(iData, split_size)
+        self.dataloader = []
+        for i0,pSub in enumerate(sub_data):
+            pData = DataLoader(pSub, batch_size=self.batch_size, shuffle=True)#,pin_memory=True)
+            self.dataloader.append(pData)
+                
     def init_weights(self,m):
         if isinstance(m, nn.Linear):
             nn.init.xavier_uniform_(m.weight)
@@ -359,7 +369,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             yerr=((torch.sqrt(yhist))/self.delta).detach().numpy()
             ytmp=(yhist*1./self.delta).detach().numpy()
             xtmp=self.h_r.detach().numpy()
-        return iFit(xtmp,ytmp,yerr)
+            xtmpf=xtmp[ytmp > 0]
+            ytmpf=ytmp[ytmp > 0]
+            yerrf=yerr[ytmp > 0]
+        return iFit(xtmpf,ytmpf,yerrf)
 
     def forward_fit_diff(self, x, y, iFit):
         xtmp = ytmp = yerr=0
@@ -378,6 +391,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         x_fit1,_,running_loss_fit1=self.forward_fit(x,y,self.fitPFunc.fitSig)
         x_fit2,_,running_loss_fit2=self.forward_fit(x,y,self.fitPFunc.fitBkg)
         return running_loss_fit2-running_loss_fit1
+        #return np.maximum(running_loss_fit2-running_loss_fit1,0.)
 
     def check_data(self):#stupid check function
         output1=0
@@ -649,6 +663,22 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss = self.mass_deco*(loss+self.bkg_loss*loss_fail)
             return loss
 
+    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint.pth"):
+        if optimizer is None:
+            torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict()}, path)
+        else:
+            torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict(),"optimizer_state_dict": optimizer.state_dict()}, path)
+        print(f"Checkpoint saved to {path}")
+
+    def load_checkpoint(self, id, optimizer = None, path="checkpoint.pth"):
+        checkpoint = torch.load(path, map_location="cpu")
+        self.model_disc[id].load_state_dict(checkpoint["model_state_dict"])
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        epoch = checkpoint["epoch"]
+        #print(f"Checkpoint loaded from {path}, resuming at epoch {epoch}")
+
+
     def pretrain(self, iData, iBatch, iNEpoch):
         pDL   = DataLoader(iData, batch_size=iBatch, shuffle=True)        
         loss  = nn.BCELoss()
@@ -668,6 +698,8 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                     running_loss += loss_output
                 if epoch % 10 == 0:
                     print('Epoch: {} LOSS train: {} '.format(epoch,running_loss))
+            self.save_checkpoint(optimizer, id)
+        
                 
     def training_mse_epoch_split(self,iModel,iDataLoader, iOptim,iOpt, iValid): #in the training do 2-fold splitting ==> Now just split and fit
         running_loss     = 0.0
@@ -753,17 +785,20 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             if self.stop:
                 break
            # iSched.step()
-            if epoch % 1 == 0:
+            if epoch % 100000 == 0 and epoch > 0:
                 print('Epoch: {} LOSS train: {} Pars 1: {} - 2: {} deco: {}'.format(epoch,loss_train,loss_fit1,loss_fit2,loss_deco))
 
-    def train(self,iNEpoch=0):
+    def train(self,iNEpoch=0, iLoad=False):
         if iNEpoch > 0:
             self.n_epochs=iNEpoch
+        if iLoad:
+            for i0 in range(self.k_fold):
+                self.load_checkpoint(i0)
         for id,pData in enumerate(self.dataloader):
-            print('K-fold {}'.format(id))
+            #print('K-fold {}'.format(id))
             valid = (id+1) % self.k_fold
             self.training_kfold(self.model_disc[id], pData, self.opt[id], self.sched[id], self.dataloader[valid])
-            
+
             
 class simple_MLPFit(torch.nn.Module):
     def __init__(self,in_data,input_size,out_channels=1,out_channels_fit1=4,out_channels_fit2=1,act_out=False,nhidden=64,batchnorm=False,batch_size=20000,n_epochs=100,n_fit_epochs=500):
@@ -948,6 +983,7 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
     
     if iOpt == 0 or iOpt == 1:
         #print(output_disc,torch.round(output_disc))
+        #xpars,result1,chi2=iModel.forward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)
         xpars,result1,chi2=iModel.forward_fit(output_disc,input,iModel.fitPFunc.fitSig)
         result1.plot()
     elif iOpt == 2: 
@@ -968,9 +1004,9 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
         print(output_bkg_disc.shape,iBkg[:,-1].shape)
         input_bkg=iBkg[:,-1]
         print(input_bkg)
-        xpars,result2,chi2=iModel.forward_fit(output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
+        xpars,result2,chi2=iModel.forward_fit(1.-output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
         result2.plot()
-        print("Bkg Significance:",iModel.forward_sig(output_bkg_disc,input_bkg.detach()))
+        print("Bkg Significance:",iModel.forward_sig(1.-output_bkg_disc,input_bkg.detach()))
     plt.show()
 
 from sklearn.metrics import roc_curve, auc
@@ -1000,22 +1036,15 @@ import numpy as np
 from scipy.stats import chi2, norm
 
 def fisher_combine_zscores(zscores):
-    zscores = np.array(zscores)
-    
-    # Convert Z-scores to one-sided p-values
-    pvalues = 1 - norm.cdf(zscores)
-    
-    # Fisher's method
+    zscores_fix=np.maximum(zscores,0.)
+    zscores_fix=np.sqrt(zscores_fix)
+    zscores_fix = np.array(zscores_fix)
+    pvalues = 1 - norm.cdf(zscores_fix)
     X = -2 * np.sum(np.log(pvalues))
     df = 2 * len(pvalues)
     p_combined = 1 - chi2.cdf(X, df)
-    
-    # Convert back to Z-score (one-sided)
     z_combined = norm.isf(p_combined)  # isf = inverse survival function = Φ⁻¹(1-p)
-    
-    return p_combined, z_combined
-
-
+    return p_combined, z_combined**2
 
 
 def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=500):
@@ -1052,3 +1081,215 @@ def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=500):
     pvalue=lNFalse/iNToys
     print("Z-score:",norm.isf(pvalue),"p-value:",pvalue)
     plt.show()
+
+from mpl_toolkits.mplot3d import Axes3D  # registers the 3D projection
+from scipy.ndimage import gaussian_filter
+import plotly.graph_objects as go
+def plot3D(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
+    lN=iSig.shape[1]-1
+    output_sig_disc=iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN))
+    output_bkg_disc=iModel.forward_disc(iBkg[:,:-1].reshape(len(iBkg),lN))
+
+    if iNS > 0:
+        lSRand=np.random.choice(iSig.shape[0],iNS,replace=False)
+        lBRand=np.random.choice(iBkg.shape[0],iNB,replace=False)
+        osdisc=output_sig_disc[lSRand]
+        obdisc=output_bkg_disc[lBRand]
+        input=torch.cat((iSig[lSRand,-1],iBkg[lBRand,-1]))
+        output_disc=torch.cat((osdisc,obdisc))
+    else:
+        input=torch.cat((iSig[:,-1],iBkg[:,-1]))
+        output_disc=torch.cat((output_sig_disc,output_bkg_disc))
+
+    print(torch.max(output_disc),torch.min(output_disc))
+    print(input.shape,output_disc.shape)
+    hist, xedges, yedges = np.histogram2d(input.detach(), output_disc.flatten().detach(),  bins=[20, 10], range=[(90,150), (0.015,1)])
+    xpos, ypos = np.meshgrid(xedges[:-1], yedges[:-1], indexing="ij")
+    xpos = xpos.ravel()
+    ypos = ypos.ravel()
+    zpos = np.zeros_like(xpos)
+
+    hist_smooth = gaussian_filter(hist, sigma=1)
+    X, Y = np.meshgrid(
+        0.5 * (xedges[:-1] + xedges[1:]),
+        0.5 * (yedges[:-1] + yedges[1:])
+        )
+    fig = plt.figure(figsize=(20, 20))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.view_init(45, 150)
+    surf = ax.plot_surface(X, Y, hist_smooth.T, cmap='viridis', edgecolor='none')
+    fig.colorbar(surf, shrink=0.5, aspect=10, label='Counts')
+    
+    # Set bar dimensions
+    #dx = (xedges[1] - xedges[0]) * 0.5  # width of bins (scaled down for spacing)
+    #dy = (yedges[1] - yedges[0]) * 0.1  # width of bins (scaled down for spacing)
+    #dz = hist.ravel()
+    #fig = plt.figure(figsize=(10, 7))
+    #ax = fig.add_subplot(111, projection='3d')
+    #ax.bar3d(xpos, ypos, zpos, dx, dy, dz, shade=True, color='skyblue')
+    ax.set_xlabel('Higgs mass (GeV)',fontsize=20, labelpad=15)
+    ax.set_ylabel('Discriminator',fontsize=20, labelpad=15)
+    #ax.set_zlabel('N')
+    plt.show()
+    
+
+class DataSet(Dataset):
+    def __init__(self, samples, labels, disc):
+        super(DataSet, self).__init__()
+        self.labels  = labels
+        self.samples = samples
+        self.disc    = disc
+        if len(samples) != len(labels):
+            raise ValueError(
+                f"should have the same number of samples({len(samples)}) as there are labels({len(labels)})")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        y = self.labels[index]
+        x = self.samples[index]
+        z = self.disc[index]
+        return x, y, z
+    
+def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5):
+    lN=iSig.shape[1]-1
+    lSigs=[]
+    lBkgs=[]
+    lDSigs=[]
+    lDBkgs=[]
+    lSigPs=[]
+    lBkgPs=[]
+    lDSigPs=[]
+    lDBkgPs=[]
+    lSigFs=[]
+    lBkgFs=[]
+    lDSigFs=[]
+    lDBkgFs=[]
+    
+    for pToy in range(iNToys):
+          print("toy:",pToy)
+          pNS     = np.random.poisson(iNS)
+          pNB     = np.random.poisson(iNB)
+          lSRand  = np.random.choice(iSig.shape[0],pNS,replace=False)
+          lBRand  = np.random.choice(iBkg.shape[0],pNB,replace=False)
+          mass    = torch.cat((iSig[lSRand,-1],iBkg[lBRand,-1]))
+          mass_bkg = iBkg[lBRand,-1]
+          allvars = torch.cat((iSig[lSRand],iBkg[lBRand]))
+          allvars_sig = iSig[lSRand]
+          allvars_bkg = iBkg[lBRand]
+          discs   = torch.cat((torch.ones(pNS), torch.zeros(pNB)))
+          rand    = torch.randperm(len(mass))
+          pXD     = allvars[rand]
+          tot     = pXD[:,:-1].float()
+          label   = pXD[:,-1].float()
+          xdisc   = discs[rand]
+          pData   = DataSet(samples=tot,labels=label, disc=xdisc)
+          iModel.reloadData(pData)
+          try:
+                iModel.train(20,iLoad=True)
+          except Exception as e:
+              continue
+
+          output_disc = iModel.forward_disc(allvars[:,:-1].reshape(len(allvars),lN))
+          obdisc      = iModel.forward_disc(allvars_bkg[:,:-1].reshape(len(lBRand),lN))
+          output_disc = torch.nan_to_num(output_disc, nan=0.0, posinf=0.0, neginf=0.0)
+          obdisc      = torch.nan_to_num(obdisc, nan=0.0, posinf=0.0, neginf=0.0)
+
+          #Non-discretized
+          try:
+            lSigP=iModel.forward_sig(output_disc,mass.detach())
+            lSigF=iModel.forward_sig(1.-output_disc,mass.detach())
+            lBSigP=iModel.forward_sig(obdisc,mass_bkg.detach())
+            lBSigF=iModel.forward_sig(1.-obdisc,mass_bkg.detach())
+          except Exception as e:
+              print("fail 1")
+              continue
+          _,lSigT=fisher_combine_zscores([lSigP,lSigF])
+          _,lBSigT=fisher_combine_zscores([lBSigP,lBSigF])
+          #print("sig",lSigP,lSigF,"bkg",lBSigP,lBSigF)
+          lSigPs.append(lSigP)
+          lSigFs.append(lSigF)
+          lBkgPs.append(lBSigP)
+          lBkgFs.append(lBSigF)
+          lSigs.append(lSigT)
+          lBkgs.append(lBSigT)
+          #Non-discretized
+          doutput_disc = torch.round(output_disc)
+          dobdisc      = torch.round(obdisc)
+          try:
+            lDSigP=iModel.forward_sig(doutput_disc,mass.detach())
+            lDSigF=iModel.forward_sig(1.-doutput_disc,mass.detach())
+            lDBSigP=iModel.forward_sig(dobdisc,mass_bkg.detach())
+            lDBSigF=iModel.forward_sig(1.-dobdisc,mass_bkg.detach())
+          except Exception as e:
+              print("fail 2")
+              continue
+          _,lDSigT=fisher_combine_zscores([lDSigP,lDSigF])
+          _,lDBkgT=fisher_combine_zscores([lDBSigP,lDBSigF])
+          lDSigPs.append(lDSigP)
+          lDSigFs.append(lDSigF)
+          lDBkgPs.append(lDSigP)
+          lDBkgFs.append(lDSigF)
+          lDSigs.append(lDSigT)
+          lDBkgs.append(lDBkgT)
+
+    print("test:",len(lDSigPs))
+    lSigPs=np.array(lSigPs)
+    lBkgPs=np.array(lBkgPs)
+    lDSigPs=np.array(lDSigPs)
+    lDBkgPs=np.array(lDBkgPs)
+    
+    lSigFs=np.array(lSigFs)
+    lBkgFs=np.array(lBkgFs)
+    lDSigFs=np.array(lDSigFs)
+    lDBkgFs=np.array(lDBkgFs)
+           
+    lSigs=np.array(lSigs)
+    lBkgs=np.array(lBkgs)
+    lNSigs=lSigs[np.isfinite(lSigs)]
+    lNBkgs=lBkgs[np.isfinite(lBkgs)]
+
+    lDSigs=np.array(lDSigs)
+    lDBkgs=np.array(lDBkgs)
+    lDNSigs=lDSigs[np.isfinite(lDSigs)]
+    lDNBkgs=lDBkgs[np.isfinite(lDBkgs)]
+
+    bins=np.linspace(0,5,40)
+    plt.hist(np.sqrt(np.maximum(lNSigs,0.)),density=True,alpha=0.5,label='hh(bb+$\gamma\gamma$)',bins=bins)
+    plt.hist(np.array(np.sqrt(np.maximum(lNBkgs,0.))),density=True,alpha=0.5,label='bkg',bins=bins)
+    plt.legend()
+    lNFalse=len(lNBkgs[lNBkgs > np.median(lNSigs)])
+    pvalue=lNFalse/iNToys
+    print("Z-score:",norm.isf(pvalue),"p-value:",pvalue,"-",np.median(lNSigs), np.median(lNBkgs))
+    plt.show()
+
+    bins=np.linspace(0,5,40)
+    plt.hist(np.sqrt(np.maximum(lDNSigs,0.)),density=True,alpha=0.5,label='hh(bb+$\gamma\gamma$)',bins=bins)
+    plt.hist(np.array(np.sqrt(np.maximum(lDNBkgs,0.))),density=True,alpha=0.5,label='bkg',bins=bins)
+    plt.legend()
+    lNFalse=len(lDNBkgs[lDNBkgs > np.median(lDNSigs)])
+    pvalue=lNFalse/iNToys
+    print("Z-score:",norm.isf(pvalue),"p-value:",pvalue, "-",np.median(lDNSigs), np.median(lDNBkgs))
+    plt.show()
+
+    data_dict={}
+    data_dict["dsig"]  = lDNSigs#lBSigPs
+    data_dict["dbkg"]  = lDNBkgs
+    data_dict["sig"]   = lNSigs
+    data_dict["bkg"]   = lNBkgs
+
+    data_dict["dsig_p"]  = lDSigPs
+    data_dict["dbkg_p"]  = lDBkgPs
+    data_dict["sig_p"]   = lSigPs
+    data_dict["bkg_p"]   = lBkgPs
+    
+    data_dict["dsig_f"]  = lDSigFs
+    data_dict["dbkg_f"]  = lDBkgFs
+    data_dict["sig_f"]   = lSigFs
+    data_dict["bkg_f"]   = lBkgFs
+
+    np.savez("spf_toys_space.npz", **data_dict)
+    #np.savez("arrays_k1_50.npz", dsig=lDNSigs, dbkg=lDNSigs, sig=lNSigs, bkg = lNBkgs )
+
+    
