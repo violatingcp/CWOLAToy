@@ -320,7 +320,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             )
             pModel_disc.apply(self.init_weights)
             self.model_disc.append(pModel_disc)
-            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.001,weight_decay=0.01))
+            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.0001))#,weight_decay=0.1))
             self.sched.append(torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
             split_size.append(len(in_data)//k_fold)
         self.output     = torch.nn.Sigmoid()
@@ -330,6 +330,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         self.dataloader = []
         sub_data = random_split(in_data, split_size)
         for pSub in sub_data:
+            self.batch_size = len(pSub)
             pData = DataLoader(pSub, batch_size=self.batch_size, shuffle=True)#,pin_memory=True)
             self.dataloader.append(pData)
         self.fitPFunc   = iFitPFunc
@@ -361,7 +362,8 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         sub_data = random_split(iData, split_size)
         self.dataloader = []
         for i0,pSub in enumerate(sub_data):
-            pData = DataLoader(pSub, batch_size=self.batch_size, shuffle=True)#,pin_memory=True)
+            self.batch_size=len(pSub)
+            pData = DataLoader(pSub, batch_size=self.batch_size, shuffle=True,pin_memory=True)
             self.dataloader.append(pData)
                 
     def init_weights(self,m):
@@ -372,11 +374,14 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     
     def forward_fit(self, x, y, iFit):
         xtmp = ytmp = yerr=0
-        if torch.sum(x) > 2.*self.nbins:
+        if torch.sum(x) > 0.1*self.nbins:
             yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=x)
             yerr=((torch.sqrt(yhist+self.delta_sys))/self.delta).detach().numpy()
             ytmp=(yhist*1./self.delta).detach().numpy()
             xtmp=self.h_r.detach().numpy()
+            ytmp=ytmp[ytmp > 0]
+            xtmp=xtmp[ytmp > 0]
+            yerr=yerr[ytmp > 0]
         #else:
         #    print("too small",torch.sum(x),self.nbins)
         return iFit(xtmp,ytmp,yerr)
@@ -670,18 +675,20 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss = self.mass_deco*(loss+self.bkg_loss*loss_fail)
             return loss
 
-    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint.pth"):
+    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint_2.pth"):
         if optimizer is None:
             torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict()}, path)
         else:
             torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict(),"optimizer_state_dict": optimizer.state_dict()}, path)
+            #torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict(),"optimizer_state_dict": self.opt[id].state_dict()}, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, id, optimizer = None, path="checkpoint.pth"):
+    def load_checkpoint(self, id, optimizer = None, path="checkpoint_2.pth"):
         checkpoint = torch.load(path, map_location="cpu")
         self.model_disc[id].load_state_dict(checkpoint["model_state_dict"])
-        if optimizer is not None:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.opt[id].load_state_dict(checkpoint["optimizer_state_dict"])
+        #if optimizer is not None:
+        #    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         epoch = checkpoint["epoch"]
         #print(f"Checkpoint loaded from {path}, resuming at epoch {epoch}")
         #for name, param in  self.model_disc[id].named_parameters():
@@ -693,7 +700,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         pDL   = DataLoader(iData, batch_size=iBatch, shuffle=True)        
         loss  = nn.BCELoss()
         for id in range(self.k_fold):
-            optimizer = torch.optim.Adam(self.model_disc[id].parameters(), lr=0.001)
+            optimizer = self.opt[id]#torch.optim.Adam(self.model_disc[id].parameters(), lr=0.001)
             for epoch in range(iNEpoch):
                 running_loss = 0
                 for batch_idx, (x, y, z) in enumerate(pDL):
@@ -794,7 +801,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss_deco,_,_ = self.training_mse_epoch(iModel, self.mcdataloader, iOptim, self.deco_opt, iValid)
             if self.stop:
                 break
-           # iSched.step()
+            #iSched.step()
             if epoch % 200 == 0 and epoch > 0:
                 print('Epoch: {} LOSS train: {} Pars 1: {} - 2: {} deco: {}'.format(epoch,loss_train,loss_fit1,loss_fit2,loss_deco))
 
@@ -802,12 +809,12 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     def load(self):
         for i0 in range(self.k_fold):
             self.load_checkpoint(i0)
-            self.opt[i0]   = (torch.optim.Adam(self.model_disc[i0].parameters(),lr=0.001,weight_decay=0.01))
-            self.sched[i0] = (torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
+            #self.opt[i0]   = (torch.optim.Adam(self.model_disc[i0].parameters(),lr=0.00005))#,weight_decay=0.01))
+            #self.sched[i0] = (torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
         
         
     def train(self,iNEpoch=0, iLoad=False):
-        if iNEpoch > 0:
+        if iNEpoch > -1:
             self.n_epochs=iNEpoch
         if iLoad:
             self.load()
@@ -1066,7 +1073,7 @@ def fisher_combine_zscores(zscores):
     return p_combined, z_combined**2
 
 
-def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=10):
+def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=10,iLabel="spf_sup_toys_space_disc_base_32_v2"):
     lN=iSig.shape[1]-1
     iModel.load()
     output_sig_disc=torch.round(iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN)))
@@ -1130,7 +1137,7 @@ def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=10):
     data_dict["bkg_p"]   = lBkgPs
     data_dict["sig_f"]   = lSigFs
     data_dict["bkg_f"]   = lBkgFs
-    np.savez("spf_sup_toys_space_disc_base_32.npz", **data_dict)
+    np.savez(iLabel+".npz", **data_dict)
     
 from mpl_toolkits.mplot3d import Axes3D  # registers the 3D projection
 from scipy.ndimage import gaussian_filter
@@ -1258,7 +1265,7 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
           pData   = DataSet(samples=tot,labels=label, disc=xdisc)
           iModel.reloadData(pData)
           try:
-            iModel.train(50,iLoad=True)
+            iModel.train(20,iLoad=True)
           except Exception as e:
             print("Fail 0")
             continue
