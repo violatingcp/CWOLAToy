@@ -312,15 +312,18 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             pModel_disc = nn.Sequential(
                 nn.Linear(input_size, nhidden),
                 nn.SiLU(),
+                nn.Dropout(p=0.5),
                 nn.Linear(nhidden, nhidden),
                 nn.SiLU(),
+                nn.Dropout(p=0.5),
                 nn.Linear(nhidden, nhidden),
                 nn.SiLU(),
+                nn.Dropout(p=0.5),
                 nn.Linear(nhidden, out_channels),
             )
             pModel_disc.apply(self.init_weights)
             self.model_disc.append(pModel_disc)
-            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.0001))#,weight_decay=0.1))
+            self.opt.append(torch.optim.Adam(pModel_disc.parameters(),lr=0.005))#,weight_decay=0.1))
             self.sched.append(torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
             split_size.append(len(in_data)//k_fold)
         self.output     = torch.nn.Sigmoid()
@@ -354,8 +357,13 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         self.deco_opt         = deco_opt
         self.stop             = False
         self.otlossdiff       = iOTLossDiff
+        self.losses           = []
+        self.valid_losses     = []
+        self.sigs             = []
+        self.valid_sigs       = []
+        self.round            = False
 
-    def reloadData(self,iData):
+    def reloadData(self,iData,iMC=None):
         split_size=[]
         for p in range(self.k_fold):
             split_size.append(len(iData)//self.k_fold)
@@ -365,6 +373,8 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             self.batch_size=len(pSub)
             pData = DataLoader(pSub, batch_size=self.batch_size, shuffle=True,pin_memory=True)
             self.dataloader.append(pData)
+        if iMC is not None:
+            self.mcdataloader     = DataLoader(iMC, batch_size=len(iMC), shuffle=True)
                 
     def init_weights(self,m):
         if isinstance(m, nn.Linear):
@@ -374,24 +384,51 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     
     def forward_fit(self, x, y, iFit):
         xtmp = ytmp = yerr=0
-        if torch.sum(x) > 0.1*self.nbins:
-            yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=x)
+        xprime=x
+        if self.round:
+            xprime = torch.round(xprime)
+        if torch.sum(xprime) > 0.1*self.nbins+4:
+            yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=xprime)
             yerr=((torch.sqrt(yhist+self.delta_sys))/self.delta).detach().numpy()
             ytmp=(yhist*1./self.delta).detach().numpy()
             xtmp=self.h_r.detach().numpy()
-            ytmp=ytmp[ytmp > 0]
             xtmp=xtmp[ytmp > 0]
             yerr=yerr[ytmp > 0]
+            ytmp=ytmp[ytmp > 0]
+            if len(xtmp)  < 4:
+                xtmp = ytmp = yerr=0
         #else:
         #    print("too small",torch.sum(x),self.nbins)
         return iFit(xtmp,ytmp,yerr)
 
+    def xforward_fit(self, x, y, iFit):
+        xtmp = ytmp = yerr=0
+        xprime=x
+        if self.round:
+            xprime = torch.round(xprime)
+        if torch.sum(x) > 0.1*self.nbins+4:#torch.round(x)) > 0.1*self.nbins+4:
+            yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=xprime)#torch.round(x))
+            yerr=((torch.sqrt(yhist+self.delta_sys))/self.delta).detach().numpy()
+            ytmp=(yhist*1./self.delta).detach().numpy()
+            xtmp=self.h_r.detach().numpy()
+            xtmp=xtmp[ytmp > 0]
+            yerr=yerr[ytmp > 0]
+            ytmp=ytmp[ytmp > 0]
+            if len(xtmp)  < 4:
+                xtmp = ytmp = yerr=0
+        #else:
+        #    print("too small",torch.sum(x),self.nbins)
+        return iFit(xtmp,ytmp,yerr),ytmp,yerr
+
     def forward_fit_diff(self, x, y, iFit):
         xtmp = ytmp = yerr=0
+        xprime=x
+        if self.round:
+            xprime=torch.round(xprime)
         if torch.sum(x) > self.nbins*2:
-            yhist1,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=x)
-            yhist2,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=1-x)
-            wfac    = torch.sum(x)/torch.sum(1.-x)
+            yhist1,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=xprime)
+            yhist2,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=1-xprime)
+            wfac    = torch.sum(xprime)/torch.sum(1.-xprime)
             yhist2 *= wfac
             yhistd = yhist1-yhist2
             yerr=(torch.sqrt(yhist1+yhist2*wfac)*1./self.delta).detach().numpy()
@@ -506,8 +543,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     def loss(self, xfit1,xfit2, x, y,iBkgPressure):
         xpars1   = torch.mean(xfit1,axis=0) #s+B
         xpars2   = torch.mean(xfit2,axis=0) #B
-        #weight1  = torch.round(torch.sigmoid(x[:,0]))
-        weight1  = torch.sigmoid(x[:,0])
+        if self.round:
+            weight1  = torch.round(torch.sigmoid(x[:,0]))
+        else:            
+            weight1  = torch.sigmoid(x[:,0])
         yhist1   = self.differentiable_histogram(y,weight1).flatten()
         chi2sig1 = (self.chi2loss(xpars1,yhist1,self.fitPFunc.funcSig,yerr2=yhist1/(self.delta)))
         chi2bkg1 = (self.chi2loss(xpars2,yhist1,self.fitPFunc.funcBkg,yerr2=yhist1/(self.delta)))
@@ -521,7 +560,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
 
     def loss_sig(self, xfit3, x, y,iBkgPressure):
         xpars3  = torch.mean(xfit3,axis=0)
-        weight2  = torch.sigmoid(x[:,0])
+        if self.round:
+            weight2  = torch.round(torch.sigmoid(x[:,0]))
+        else:
+            weight2  = torch.sigmoid(x[:,0])
         yhist3   = self.differentiable_histogram(y,weight2).flatten()
         chi2bkg  = (self.chi2loss(xpars3,yhist3,self.fitPFunc.funcBkg,yerr2=yhist3))*self.delta
         loss=chi2bkg
@@ -532,8 +574,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     
     def loss_bkg(self, xfit3, x, y,iBkgPressure):
         xpars3  = torch.mean(xfit3,axis=0)
-        weight2  = 1-torch.sigmoid(x[:,0])
-        #weight2  = torch.round(1-torch.sigmoid(x[:,0]))
+        if self.round:
+            weight2  = torch.round(1-torch.sigmoid(x[:,0]))
+        else:
+            weight2  = 1-torch.sigmoid(x[:,0])
         yhist3   = self.differentiable_histogram(y,weight2).flatten()
         chi2bkg  = (self.chi2loss(xpars3,yhist3,self.fitFFunc.funcBkg,yerr2=yhist3))*self.delta
         loss=chi2bkg
@@ -545,8 +589,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     def loss_fail(self, xfit1,xfit2, x, y,iBkgPressure,iInvert=False):
         xpars1   = torch.mean(xfit1,axis=0)
         xpars2   = torch.mean(xfit2,axis=0)
-        weight1  = 1-torch.sigmoid(x[:,0])
-        #weight1  = torch.round(1-torch.sigmoid(x[:,0]))
+        if self.round:
+            weight1  = torch.round(1-torch.sigmoid(x[:,0]))
+        else:
+            weight1  = 1-torch.sigmoid(x[:,0])
         if iInvert:
             weight1 = torch.sigmoid(x[:,0])
         yhist1   = self.differentiable_histogram(y,weight1).flatten()
@@ -563,8 +609,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     def loss_diff(self, xfit1, xfit2, x, y,iBkgPressure):
         xpars1   = torch.mean(xfit1,axis=0)
         xpars2   = torch.mean(xfit2,axis=0)
-        weight1  = torch.sigmoid(x[:,0])
-        #weight1  = torch.round(torch.sigmoid(x[:,0]))
+        if self.round:
+            weight1  = torch.round(torch.sigmoid(x[:,0]))
+        else:
+            weight1  = torch.sigmoid(x[:,0])
         weight2  = 1-weight1 
         wfac     = torch.sum(weight1)/torch.sum(weight2)
         weight2  = weight2*wfac
@@ -585,6 +633,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
     def validate(self,iModel, iValid, iLoss, iOpt):
         iModel.train(False)
         losstot=0
+        lSig=0
         for batch_idx, (x, y, z) in enumerate(iValid):
             x = x.reshape((len(x),x.shape[1]))
             x_test = self.forward_disc_model(x, iModel)
@@ -594,14 +643,18 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 var = torch.var(x_test*x)
                 losscheck = losscheck + self.lambvar*torch.sum(var)
             losstot  += losscheck
+            lSig += running_loss1_fit1-running_loss1_fit2
         #print("Validation loss: {} Regular loss: {}".format(losstot,iLoss))
         if losstot-iLoss > self.otlossdiff and iLoss < -2.:
             print("Overtrained loss {} valid {}".format(iLoss,losstot))
             self.stop = True
-
+        self.valid_losses.append(losstot.item())
+        self.valid_sigs.append(lSig)
+            
     def training_mse_epoch(self,iModel, iDataLoader, iOptim, iOpt, iValid):
         running_loss     = 0.0
         updates=0
+        lSig=0
         for batch_idx, (x, y, z) in enumerate(iDataLoader):
             iOptim.zero_grad()
             iModel.train(False)
@@ -615,8 +668,12 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss = loss + self.lambvar*torch.sum(var)
             loss.backward()
             iOptim.step()
-            running_loss += loss 
+            running_loss += loss
+            pSig=running_loss_fit1-running_loss_fit2
+            lSig += pSig           
             updates = updates+1
+        self.losses.append(running_loss.item()/updates)
+        self.sigs.append(lSig)
         if self.k_fold > 1:
             self.validate(iModel,iValid,running_loss,iOpt)
         return running_loss/updates,running_loss_fit1,running_loss_fit2
@@ -675,7 +732,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss = self.mass_deco*(loss+self.bkg_loss*loss_fail)
             return loss
 
-    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint_2.pth"):
+    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint_2_dpout.pth"):
         if optimizer is None:
             torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict()}, path)
         else:
@@ -683,7 +740,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             #torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict(),"optimizer_state_dict": self.opt[id].state_dict()}, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, id, optimizer = None, path="checkpoint_2.pth"):
+    def load_checkpoint(self, id, optimizer = None, path="checkpoint_2_dpout.pth"):
         checkpoint = torch.load(path, map_location="cpu")
         self.model_disc[id].load_state_dict(checkpoint["model_state_dict"])
         self.opt[id].load_state_dict(checkpoint["optimizer_state_dict"])
@@ -755,7 +812,6 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         if self.k_fold > 1:
             self.validate(iModel,iValid,running_loss,iOpt)
         return running_loss/updates,running_loss1_fit1+running_loss2_fit1,running_loss1_fit2+running_loss2_fit2
-
     
     def training_mse_epoch_sample(self,iModel, iDataLoader, iOptim, iOpt, iValid): #in the training do 2-fold splitting ==> Now just split and fit
         running_loss     = 0.0
@@ -786,6 +842,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             iOptim.step()
             running_loss += loss 
             updates = updates+1
+        self.losses.append(running_loss.item()/updates)
         if self.k_fold > 1:
             self.validate(iModel,iValid,running_loss,iOpt)
         return running_loss/updates,running_loss1_fit1,running_loss1_fit2
@@ -806,12 +863,18 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 print('Epoch: {} LOSS train: {} Pars 1: {} - 2: {} deco: {}'.format(epoch,loss_train,loss_fit1,loss_fit2,loss_deco))
 
 
-    def load(self):
+    def load(self,lr=0.0001):
         for i0 in range(self.k_fold):
             self.load_checkpoint(i0)
             #self.opt[i0]   = (torch.optim.Adam(self.model_disc[i0].parameters(),lr=0.00005))#,weight_decay=0.01))
             #self.sched[i0] = (torch.optim.lr_scheduler.LinearLR(self.opt[-1], start_factor=0.5, total_iters=200))
-        
+            for param_group in self.opt[i0].param_groups:
+                param_group['lr'] = lr
+        self.losses=[]
+        self.valid_losses=[]
+        self.sigs=[]
+        self.valid_sigs=[]
+
         
     def train(self,iNEpoch=0, iLoad=False):
         if iNEpoch > -1:
@@ -821,7 +884,10 @@ class simple_MLPFit_lmfit(torch.nn.Module):
         for id,pData in enumerate(self.dataloader):
             #print('K-fold {}'.format(id))
             valid = (id+1) % self.k_fold
-            self.training_kfold(self.model_disc[id], pData, self.opt[id], self.sched[id], self.dataloader[valid])
+            if self.k_fold == 1:
+                self.training_kfold(self.model_disc[id], pData, self.opt[id], self.sched[id], self.mcdataloader)
+            else:
+                self.training_kfold(self.model_disc[id], pData, self.opt[id], self.sched[id], self.dataloader[valid])
 
             
 class simple_MLPFit(torch.nn.Module):
@@ -983,6 +1049,41 @@ def plotCheck(iModel,iOpt=1):
     result2.plot()
     plt.show()
 
+def prettyPlot(iresult,y,yerr,sig):
+    x = iresult.userkws['x']  # or however you pass x to the model
+    #y = iresult.userkws['y']  # observed data
+    y_fit = iresult.best_fit
+    residuals = (y - y_fit)/yerr
+    
+    fig, (ax_fit, ax_res) = plt.subplots(2, 1, figsize=(8,6), gridspec_kw={'height_ratios':[3,1]}, sharex=True)
+
+    # --- Top panel: data + fit ---
+    ax_fit.errorbar(x, y, yerr=yerr, fmt='o', color='#1f77b4', ecolor='#1f77b4', elinewidth=1.2,
+                capsize=3, label='Data')
+    ax_fit.plot(x, y_fit, color='#228B22', linewidth=2.5, label='Best fit')
+    #228B22#E63946#ff7f0e
+    ax_fit.set_ylabel("Events", fontsize=14)
+    #ax_fit.set_title("Fit with Residuals", fontsize=16, fontweight='bold')
+    ax_fit.legend(fontsize=12)
+    ax_fit.grid(True, linestyle='--', alpha=0.6)
+    ax_fit.minorticks_on()
+
+    # --- Bottom panel: residuals ---
+    ax_res.axhline(0, color='black', linestyle='--', linewidth=1)
+    ax_res.errorbar(x, residuals, yerr=yerr, fmt='o', color='#1f77b4', ecolor='#1f77b4', elinewidth=1.2,
+                    capsize=3, label='Residuals')
+    ax_res.set_xlabel("m$_{\gamma\gamma}$(GeV)", fontsize=14)
+    ax_res.set_ylabel("Residual", fontsize=14)
+    ax_res.grid(True, linestyle='--', alpha=0.6)
+    ax_res.minorticks_on()
+    significance_text="Significance:"+(str(np.sqrt(sig))[:3])
+    ax_fit.text(0.02, 0.02, significance_text, transform=ax_fit.transAxes,
+            fontsize=12, verticalalignment='bottom', horizontalalignment='left',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+    plt.tight_layout()
+    plt.show()
+
 def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
     lN=iSig.shape[1]-1
     output_sig_disc=iModel.forward_disc(iSig[:,:-1].reshape(len(iSig),lN))
@@ -1000,17 +1101,22 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
         input=torch.cat((iSig[:,-1],iBkg[:,-1]))
         output_disc=torch.cat((output_sig_disc,output_bkg_disc))
 
-    _,bins,_=plt.hist(output_sig_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='sig')
-    plt.hist(output_bkg_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='bkg',bins=bins)
+    _,bins,_=plt.hist(output_sig_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='hh(bb$\gamma\gamma$)')
+    plt.hist(output_bkg_disc[:,0].flatten().detach().numpy(),density=True,alpha=0.5,label='QCD',bins=bins)
+    plt.xlabel("Discriminator")
+    plt.ylabel("Normalized")
     plt.legend()
     plt.show()
     
     if iOpt == 0 or iOpt == 1:
         #print(output_disc,torch.round(output_disc))
         #xpars,result1,chi2=iModel.forward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)
-        xpars,result1,chi2=iModel.forward_fit(output_disc,input,iModel.fitPFunc.fitSig)
+        (xpars,result1,chi2),y,yerr=iModel.xforward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)         
+        sig=iModel.forward_sig(torch.round(output_disc),input.detach())
+        prettyPlot(result1,y,yerr,sig)
         print(result1.fit_report())
         result1.plot()
+        
     elif iOpt == 2: 
         xpars,result1,chi2=iModel.forward_fit_diff(output_disc,input,iModel.fitPFunc.fitSig)
         result1.plot()
@@ -1019,18 +1125,19 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
 
     if iOpt ==1:
         #xpars,result2,chi2=iModel.forward_fit(torch.round(1.-output_disc),input,iModel.fitFFunc.fitSig)
-        xpars,result2,chi2=iModel.forward_fit(1.-output_disc,input,iModel.fitFFunc.fitSig)
-        result2.plot()
+        (xpars,result2,chi2),y,yerr=iModel.xforward_fit(1.-output_disc,input,iModel.fitFFunc.fitSig)
+        #result2.plot()
+        sig=iModel.forward_sig(1.-output_disc,input.detach())
+        prettyPlot(result2,y,yerr,sig)
         print(result2.fit_report())
         print("Fail Significance:",iModel.forward_sig(1.-output_disc,input.detach()))
     plt.show()
  
-    print("here!")
     if iOpt ==1:
-        print(output_bkg_disc.shape,iBkg[:,-1].shape)
         input_bkg=iBkg[:,-1]
-        print(input_bkg)
-        xpars,result2,chi2=iModel.forward_fit(output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
+        input_sig=iSig[:,-1]
+        #(xpars,result2,chi2),y,yerr=iModel.xforward_fit(1.-output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
+        (xpars,result2,chi2),y,yerr=iModel.xforward_fit(output_sig_disc,input_sig,iModel.fitPFunc.fitSig)
         result2.plot()
         print("Bkg Significance:",iModel.forward_sig(output_bkg_disc,input_bkg.detach()))
     plt.show()
@@ -1265,7 +1372,7 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
           pData   = DataSet(samples=tot,labels=label, disc=xdisc)
           iModel.reloadData(pData)
           try:
-            iModel.train(20,iLoad=True)
+            iModel.train(100,iLoad=True)
           except Exception as e:
             print("Fail 0")
             continue
@@ -1428,3 +1535,22 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
 
     
     
+def plotLoss(iModel):
+    tmp_loss  =  np.array(iModel.losses)
+    tmp_valid =  np.array(iModel.valid_losses)
+    tmp_valid_2 = tmp_valid + (iModel.losses[0]*np.ones(len(iModel.losses))-iModel.valid_losses[0]*np.ones(len(iModel.losses)))
+    plt.plot(tmp_loss,label="loss")
+    plt.plot(tmp_valid,label="validation")
+    plt.plot(tmp_valid_2,label="validation",linestyle="dashed")
+    plt.legend()
+    plt.show()
+
+def plotSigs(iModel):
+    tmp_loss  =  np.array(iModel.sigs)
+    tmp_valid =  np.array(iModel.valid_sigs)
+    tmp_valid_2 = tmp_valid + (iModel.valid_sigs[0]*np.ones(len(iModel.sigs))-iModel.valid_sigs[0]*np.ones(len(iModel.sigs)))
+    plt.plot(tmp_loss,label="significance")
+    plt.plot(tmp_valid,label="validation")
+    plt.plot(tmp_valid_2,label="validation",linestyle="dashed")
+    plt.legend()
+    plt.show()
