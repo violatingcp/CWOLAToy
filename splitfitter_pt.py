@@ -5,302 +5,232 @@ from torch.utils.data import Sampler, BatchSampler, Dataset, DataLoader, Subset,
 import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve
 from matplotlib import pyplot as plt
-import lmfit
+from torchmin import minimize
+from torchmin.benchmarks import rosen
 
-class fitGausFlat():
-    def __init__(self, iNFreePars=4,iPos=True):
-        self.model_fit1 = lmfit.Model(self.funcSig_np)
-        self.model_fit2 = lmfit.Model(self.funcBkg_np)
-        self.model_par1 = self.model_fit1.make_params(par0=0.1,par1=0.0, par2=0.0,par3=0.5)
-        self.model_par2 = self.model_fit2.make_params(par0=0.1)        
-        #if iPos:
-        #    self.model_par1['par1'].set(min=0)
-        #else:
-        #    self.model_par1['par1'].set(max=0)
-        if iNFreePars < 3:
-            self.model_par1['par2'].vary = False
-        if iNFreePars < 4:
-            self.model_par1['par3'].vary = False
+#def minimize(iFunc,
+
+def hvp2(grad, v, pars):
+    hv = torch.autograd.grad(grad, pars, grad_outputs=v, retain_graph=True)
+    return torch.cat([h.contiguous().view(-1) for h in hv])
+
+# Hessian-vector product
+def hvp(loss, params, v):
+    grad = torch.autograd.grad(loss, params, create_graph=True)[0]
+    dot = torch.sum(grad * v)
+    hv = torch.autograd.grad(dot, params, retain_graph=True)[0]
+    return hv
+
+def cg_solve(Hv_func, g, damping=1e-2, tol=1e-5, max_iter=None):
+    if max_iter is None:
+        max_iter = len(g)
+    x = torch.zeros_like(g)
+    r = -g.clone()
+    p = r.clone()
+    rsold = torch.dot(r,r)
+    for i in range(max_iter):
+        Hp = Hv_func(p) + damping*p
+        alpha = rsold / (torch.dot(p, Hp) + 1e-12)
+        x = x + alpha * p
+        r = r - alpha * Hp
+        rsnew = torch.dot(r,r)
+        if rsnew < tol:
+            break
+        p = r + (rsnew/rsold)*p
+        rsold = rsnew
+    return x
+
+# Truncated Conjugate Gradient for Trust Region
+def truncated_cg(hvp_func, grad, trust_radius, max_iter=50):
+    x = torch.zeros_like(grad)
+    r = -grad.clone()
+    p = r.clone()
+    rs_old = torch.dot(r, r)
+
+    for i in range(max_iter):
+        Hp = hvp_func(p)
+        alpha = rs_old / (torch.dot(p, Hp) + 1e-10)
+
+        x_new = x + alpha * p
+
+        if torch.norm(x_new) > trust_radius:
+            # Step hits the boundary of the trust region
+            tau = solve_trust_boundary(x, p, trust_radius)
+            return x + tau * p
+
+        x = x_new
+        r = r - alpha * Hp
+        rs_new = torch.dot(r, r)
+        if rs_new.sqrt() < 1e-8:
+            break
+        p = r + (rs_new / rs_old) * p
+        rs_old = rs_new
+    return x
+
+
+# ---------------------------------------------
+# Newton–CG optimizer
+# ---------------------------------------------
+def newton_cg(iFunc, iX, iY, iYE2, params, iLoss, tol_grad=1e-6, tol_step=1e-6, max_outer=50, damping=1e-2):
+    params = params.clone().detach().requires_grad_(True)
+    def closure(p):
+        return iLoss(p,iX,iY,iYE2,iFunc)
+    for outer_iter in range(max_outer):
+        loss = closure(params)
+        grad = torch.autograd.grad(loss, params, create_graph=True)[0]
+
+        grad_norm = grad.norm()
+        if grad_norm < tol_grad:
+            print(f"Converged at iter {outer_iter}: grad_norm={grad_norm:.3e}")
+            break
+
+        # Hessian-vector product function
+        #Hv_func = lambda v: hvp(loss, params, v)
+        Hv_func = lambda v: hvp2(grad,v,params)
+        step_dir = cg_solve(Hv_func, grad, damping=damping,tol=max(1e-10, 0.1*grad_norm))
         
-    #Fit functions
-    def funcSig(self,x,pars):#0,par1,par2,par3):
-        val=-1*((x-pars[2])/pars[3])**2
-        prob=torch.exp(val)
-        return pars[1]*prob + pars[0]  
+        # Line search or fixed step
+        new_params = params + step_dir
+        new_loss = closure(new_params).item()
 
-    def funcSig_np(self,x,par0,par1,par2,par3):
-        val=-1*((x-par2)/par3)**2
-        prob=np.exp(val)
-        return par1*prob + par0  
-
-    def funcBkg_np(self,x,par0):
-        return par0
-
-    def funcBkg(self,x,pars):
-        return pars[0]
-
-    def fitSig(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,4))
-        return results,result,chisqr
-
-    def fitBkg(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=False)
-            results=torch.tensor(((result.params['par0'].value,0.,0.,0.)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,4))
-        return results,result,chisqr
-
-
-class fitGausPowLaw():
-    def __init__(self, iNFreePars=5):
-        self.model_fit1 = lmfit.Model(self.funcSig_np)
-        self.model_fit2 = lmfit.Model(self.funcBkg_np)
-        self.model_par1 = self.model_fit1.make_params(par0=0.1,par1=0.1, par2=0.,par3=0.5,par4=0.1, par5=-3.1,par6=4.)
-        self.model_par2 = self.model_fit2.make_params(par0=0.1,par1=20., par2=2200.,par3=0.1)        
-        #self.model_par1['par1'].set(min=0)
-        #self.model_par1['par4'].set(min=0)
-        #self.model_par2['par3'].set(min=1)   
-        #if iNFreePars < 3:
-        #    self.model_par1['par2'].vary = False
-        #if iNFreePars < 3:
-        #    self.model_par1['par3'].vary = False
-        #self.model_par1['par4'].vary = False
-        #self.model_par1['par5'].vary = False
-        #self.model_par1['par6'].vary = False
-        self.model_par2['par0'].vary = False
-        self.model_par2['par1'].vary = False
-        self.model_par2['par2'].vary = False
-        self.model_par2['par3'].vary = False
+        # Automatic stopping by step size
+        step_norm = step_dir.norm()
+        params = new_params.clone().detach().requires_grad_(True)
         
-    #Fit functions
-    def funcSig(self,x,pars):#0,par1,par2,par3):
-        val=-1*((x-pars[2])/pars[3])**2
-        prob=torch.exp(val)
-        return pars[1]*prob + pars[0] + pars[4]*(x-pars[5])**(-pars[6])
-
-    def funcSig_np(self,x,par0,par1,par2,par3,par4,par5,par6):
-        val=-1*((x-par2)/par3)**2
-        prob=np.exp(val)
-        return par1*prob + par0 + par4*(x-par5)**(-par6)
-
-    def funcBkg_np(self,x,par0,par1,par2,par3):
-        return par0+par1*(x-par2)**(-par3)
-
-    def funcBkg(self,x,pars):
-        return pars[0]+pars[1]*(x-pars[2])**(-pars[3])
-
-    def fitSig(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,result.params['par4'].value,result.params['par5'].value,result.params['par6'].value)))
-            chisqr=result.chisqr
+        if new_loss > loss.item():
+            damping *= 10
+            continue
         else:
-            results=torch.tensor((0.,0.,0.,0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,7))
-        return results,result,chisqr
+            # Accept step
+            params = new_params.detach().requires_grad_(True)
+            damping = max(damping/2, 1e-8)  # decrease damping slowly
 
-    def fitBkg(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=True)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,0.,0.,0.)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,7))
-        return results,result,chisqr
+        step_norm = step_dir.norm()
+        #print(f"Iter {outer_iter}: loss={loss.item():.6f}, grad_norm={grad_norm:.3e}, step_norm={step_norm:.3e}")
+        if step_norm < tol_step:
+        #    print(f"Step norm small at iter {outer_iter}, stopping.")
+            break
+    
+    return params.detach(),closure(params)
 
-class fitGausDijet():
-    def __init__(self, iNFreePars=5):
-        self.model_fit1 = lmfit.Model(self.funcSig_np)
-        self.model_fit2 = lmfit.Model(self.funcBkg_np)
-        self.model_par1 = self.model_fit1.make_params(par0=0.3,par1=-20., par2=-2.5,par3=0.0,par4=1., par5=3500.,par6=150.)
-        self.model_par2 = self.model_fit2.make_params(par0=0.3,par1=-20., par2=-2.5,par3=0.0)        
-        #self.model_par1['par1'].set(min=0)
-        #self.model_par1['par4'].set(min=0)
-        #self.model_par2['par3'].set(min=1)   
-        #if iNFreePars < 3:
-        #    self.model_par1['par2'].vary = False
-        #if iNFreePars < 3:
-        #    self.model_par1['par3'].vary = False
-        #self.model_par1['par4'].vary = False
-        #self.model_par1['par5'].vary = False
-        #self.model_par1['par6'].vary = False
-        self.model_par2['par0'].vary = True
-        self.model_par2['par1'].vary = True
-        self.model_par2['par2'].vary = True
-        self.model_par2['par3'].vary = True
-        self.model_par1['par1'].vary = True
-        self.model_par1['par2'].vary = True
-        self.model_par1['par3'].vary = True
-        self.model_par1['par5'].vary = False
-        self.model_par1['par6'].vary = False
+# Hessian-vector product
+def hvp2(grad, v, pars):
+    hv = torch.autograd.grad(grad, pars, grad_outputs=v, retain_graph=True)
+    return torch.cat([h.contiguous().view(-1) for h in hv])
 
-    #Fit functions
-    def funcSig(self,x,pars):#0,par1,par2,par3):
-        val=-1*((x-pars[5])/pars[6])**2
-        prob=torch.exp(val)
-        return pars[4]*prob + 1e5*pars[0]*(1-x/14000.)**(-pars[1])/((x/14000.)**(pars[2]+pars[3]*torch.log(x/14000.)))
+# Compute tau for trust region boundary
+def solve_trust_boundary(x, p, delta):
+    a = torch.dot(p, p)
+    b = 2 * torch.dot(x, p)
+    c = torch.dot(x, x) - delta**2
+    tau = (-b + torch.sqrt(b**2 - 4*a*c)) / (2*a)
+    return tau
 
-    def funcSig_np(self,x,par0,par1,par2,par3,par4,par5,par6):
-        val=-1*((x-par5)/par6)**2
-        prob=np.exp(val)
-        return par4*prob + 1e5*par0*(1-x/14000.)**(-par1)/((x/14000.)**(par2+par3*np.log(x/14000.)))
 
-    def funcBkg_np(self,x,par0,par1,par2,par3):
-        return 1e5*par0*(1-x/14000.)**(-par1)/((x/14000.)**(par2+par3*np.log(x/14000.)))
+def netwon_cg_v2(iFunc,iX,iY,iYE2,iParams,iLoss,dampingconst=1e-3,iMaxNEpochs=100):
+    def closure(p):
+        return iLoss(p,iX,iY,iYE2,iFunc)
+    H_damped = 0
+    #pars=iParams.clone()
+    delta=1.0
+    dampingconst0=dampingconst
+    loss_out=[]
+    for epoch in range(iNEpoch):
+        # Compute gradient
+        loss = closure(iParams)
+        grad = torch.autograd.grad(loss, iParams, create_graph=True)[0]
+        # Compute Hessian
+        #H = hessian(closure, iParams)
+        # Damping for stability
+        #damping = dampingconst0 * torch.eye(H.shape[0])
+        #H_damped = H + damping
 
-    def funcBkg(self,x,pars):
-        return 1e5*pars[0]*(1-x/14000.)**(-pars[1])/((x/14000.)**(pars[2]+pars[3]*torch.log(x/14000.)))
-
-    def fitSig(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,result.params['par4'].value,result.params['par5'].value,result.params['par6'].value)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,7))
-        return results,result,chisqr
-
-    def fitBkg(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=False)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,0.,0.,0.)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,7))
-        return results,result,chisqr
-
-class fitGausLin():
-    def __init__(self, iNFreePars=4):
-        self.model_fit1 = lmfit.Model(self.funcSig_np)
-        self.model_fit2 = lmfit.Model(self.funcBkg_np)
-        self.model_par1 = self.model_fit1.make_params(par0=0.1,par1=0.1, par2=0.,par3=0.5,par4=0.)
-        self.model_par2 = self.model_fit2.make_params(par0=0.1,par1=0.0)        
-        self.model_par1['par1'].vary  = False
-        if iNFreePars < 3:
-            self.model_par1['par2'].vary = False
-        if iNFreePars < 3:
-            self.model_par1['par3'].vary = False
+        #newton-cg
+        def hv_func(v):
+            return hvp2(grad, v, iParams)
+        step = truncated_cg(hv_func, grad,  delta)
+        iParams = iParams + step*dampingconst
         
-    #Fit functions
-    def funcSig(self,x,pars):#0,par1,par2,par3):
-        val=-1*((x-pars[2])/pars[3])**2
-        prob=torch.exp(val)
-        return pars[1]*prob + pars[0]  
-
-    def funcSig_np(self,x,par0,par1,par2,par3,par4):
-        val=-1*((x-par2)/par3)**2
-        prob=np.exp(val)
-        return par1*prob + par0 + par4*x  
-
-    def funcBkg_np(self,x,par0,par1):
-        return par0+par1*x
-
-    def funcBkg(self,x,pars):
-        return pars[0]+pars[1]*x
-
-    def fitSig(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,result.params['par4'].value)))
-            chisqr=result.chisqr
+        #trust step
+        #step = solve_trust_region2(H_damped, grad, delta)
+        #pars = pars - step
+        
+        # Newton step
+        #delta = -torch.linalg.solve(H_damped, grad.detach())
+        #iParams = (iParams.detach() + delta).requires_grad_()
+        
+        new_loss = closure(iParams)
+        if loss.item()-new_loss.item() > 0:
+            delta *= 1.5  # Increase trust radius
+            dampingconst0 *= 0.8  # Reduce damping
         else:
-            results=torch.tensor((0.,0.,0.,0.,0.))
-            result=chisqr=0
-        results=results.reshape((1,5))
-        return results,result,chisqr
-
-    def fitBkg(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=False)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,0.,0.)))
-            chisqr=result.chisqr
-        else:
-            results=torch.tensor((0.,0.,0.,0.,0.))
-            result=chisqr=0
-        #results=results.reshape((1,5))
-        return results,result,chisqr
+            delta *= 0.5  # Shrink trust radius
+            dampingconst0 *= 1.5  # Increase damping
+        loss_out.append(loss.item())
+        if epoch % 25 == 0:
+            print(f"Epoch {epoch+1}: Loss = {closure(iParams).item():.4f}")
+    #def closuref(p):
+    #    y_pred = iModel(iX, p)
+    #    return iLoss(y_pred, iY, [])
+    #H_final = hessian(closuref, iParams)
+    return iParams,loss_out
 
 
 class fitGausBern():
     def __init__(self, iNFreePars=2):
-        self.model_fit1 = lmfit.Model(self.funcSig_np)
-        self.model_fit2 = lmfit.Model(self.funcBkg_np)
-        #self.model_par1 = self.model_fit1.make_params(par0=10,par1=50.0, par2=125., par3=2.5,par4=20.,par5=10.)
-        #self.model_par2 = self.model_fit2.make_params(par0=10,par1=20.0, par2=10.0)
-        self.model_par1 = self.model_fit1.make_params(par0=50.,par1=50.0, par2=125., par3=2.5,par4=0.,par5=0.)
-        self.model_par2 = self.model_fit2.make_params(par0=50.,par1=0.0, par2=0.0)
-        self.model_par1['par1'].set(min=0)
-        if iNFreePars < 3:
-            self.model_par1['par2'].vary = False
-        if iNFreePars < 3:
-            self.model_par1['par3'].vary = False
+        self.initparams = torch.tensor([-0.1104,  0.0009,  0.1103,  0.0], dtype=torch.float64, requires_grad=True)
+        self.fitmethod  = 'cg'
         
     #Fit functions
-    def funcSig(self,x,pars):#0,par1,par2,par3):
-        val=-1*((x-pars[2])/pars[3])**2
+    def funcSig(self,x,p):
+        val=-1*((x-125.)/2.5)**2
         prob=torch.exp(val)
-        #return pars[1]*prob + pars[0]*x**2   + pars[4]*x*(1-x) + pars[5]*(1-x)**2
-        return pars[1]*prob + pars[0]   + pars[4]*x + pars[5]*(x**2)
+        y_pred =  p[2] * x**2 + p[1] * x * (1-x) + p[0]*(1-x)**2 + p[3]*prob
+        return y_pred
 
-    def funcSig_np(self,x,par0,par1,par2,par3,par4,par5):
-        val=-1*((x-par2)/par3)**2
-        prob=np.exp(val)
-        #return par1*prob + par0*x**2 + par4*x*(1-x) + par5*(1-x)**2
-        return par1*prob + par0 + par4*x + par5*(x**2)   
+    def funcBkg(self,x,p):
+        y_pred =  p[2] * x**2 + p[1] * x * (1-x) + p[0]*(1-x)**2 #p[2] * x**2 + p[1] * x + p[0] 
+        return y_pred
 
-    def funcBkg_np(self,x,par0,par1,par2):
-        #return par0*x**2+par1*x*(1-x)+par2*(1-x)**2
-        return par0+par1*x+par2*x**2
-
-    def funcBkg(self,x,pars):
-        #return pars[0]*x**2+pars[1]*x*(1-x)+pars[2]*(1-x)**2
-        return pars[0]+pars[1]*x+pars[2]*x**2
-
-    def fitSig(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit1.fit(ytmp, self.model_par1, x=xtmp,weights=1./yerr,verbose=False)#self.h_r)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,result.params['par3'].value,result.params['par4'].value,result.params['par5'].value)))
-            chisqr=result.chisqr
+    def loss_fn(self,p,x,y,yerr2,iFunc):
+        y_pred = iFunc(x,p)
+        loss = torch.sum((y_pred - y)**2/yerr2)
+        return loss
+    
+    def fitSig(self,xtmp,ytmp,yerr2):
+        if torch.sum(ytmp) > 0:
+            #def loss_wrap(p):
+             #   return self.loss_fn(p,xtmp,ytmp,yerr,iFunc=self.funcSig)
+            #result=minimize(loss_wrap, self.initparams, method=self.fitmethod)
+            #results=result.x
+            #chisqr=result.fun.numpy()
+            p=self.initparams.clone()
+            results,chisqr=newton_cg(self.funcSig,xtmp,ytmp,yerr2,p,self.loss_fn)
+            result=0
         else:
-            #results=torch.tensor(((self.model_fit1.params['par0'].value,self.model_fit1.params['par1'].value,self.model_fit1.params['par2'].value,self.model_fit1.params['par3'].value,self.model_fit1.params['par4'].value,self.model_fit1.params['par5'].value)))
-            results=torch.tensor((0.,0.,0.,0.,0.,0.))
+            results=torch.tensor((0.,0.,0.,0.))
             result=chisqr=100
-        results=results.reshape((1,6))
+        results=results.reshape((1,4))
         return results,result,chisqr
 
-    def fitBkg(self,xtmp,ytmp,yerr):
-        if np.sum(ytmp) > 0:
-            result=self.model_fit2.fit(ytmp, self.model_par2, x=xtmp,weights=1./yerr,verbose=False)
-            results=torch.tensor(((result.params['par0'].value,result.params['par1'].value,result.params['par2'].value,0.,0.,0.)))
-            chisqr=result.chisqr
+    def fitBkg(self,xtmp,ytmp,yerr2):
+        if torch.sum(ytmp) > 0:
+            #def loss_wrap(p):
+            #    return self.loss_fn(p,xtmp,ytmp,yerr,iFunc=self.funcBkg)
+            #result=minimize(loss_wrap, self.initparams, method=self.fitmethod)
+            #results=result.x
+            #chisqr=result.fun.numpy()
+            p=self.initparams.clone()
+            results,chisqr=newton_cg(self.funcBkg,xtmp,ytmp,yerr2,p,self.loss_fn)
+            result=0
         else:
-            #results=torch.tensor((self.model_fit2['par0'].value,self.model_fit2['par1'].value,self.model_fit2['par2'].value,0.,0.,0.))
-            results=torch.tensor((0.,0.,0.,0.,0.,0.))
+            results=torch.tensor((0.,0.,0.,0.))
             result=chisqr=100
-        results=results.reshape((1,6))
+        results=results.reshape((1,4))
         return results,result,chisqr
 
-
-class simple_MLPFit_lmfit(torch.nn.Module):
-    def __init__(self,in_data,input_size,out_channels=1,act_out=False,nhidden=32,batch_size=20000,n_epochs=100,n_bins=40,fit_opt=1,bkg_loss=0.01,iFitPFunc=fitGausFlat(),iFitFFunc=fitGausFlat(),lambScale=4.0,bkgPressure=True,massDeco=0,mc_data=0,deco_opt=4,k_fold=1,lambvar=0.,iOTLossDiff=6.):
+class simple_MLPFit_fit(torch.nn.Module):
+    def __init__(self,in_data,input_size,out_channels=1,act_out=False,nhidden=32,batch_size=20000,n_epochs=100,n_bins=40,fit_opt=1,bkg_loss=0.01,iFitPFunc=fitGausBern(),iFitFFunc=fitGausBern(),lambScale=4.0,bkgPressure=True,massDeco=0,mc_data=0,deco_opt=4,k_fold=1,lambvar=0.,iOTLossDiff=6.):
         super().__init__()
         self.k_fold=k_fold
         self.lambvar = lambvar
@@ -383,42 +313,42 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 nn.init.zeros_(m.bias)
     
     def forward_fit(self, x, y, iFit):
-        xtmp = ytmp = yerr=0
+        xtmp = ytmp = yerr2=0
         xprime=x
         if self.round:
             xprime = torch.round(xprime)
         if torch.sum(xprime) > 0.1*self.nbins+4:
             yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=xprime)
-            yerr=((torch.sqrt(yhist+self.delta_sys))/self.delta).detach().numpy()
-            ytmp=(yhist*1./self.delta).detach().numpy()
-            xtmp=self.h_r.detach().numpy()
+            yerr2=((yhist+self.delta_sys)/(self.delta**2)).detach()
+            ytmp=(yhist*1./self.delta).detach()
+            xtmp=self.h_r.detach()
             xtmp=xtmp[ytmp > 0]
-            yerr=yerr[ytmp > 0]
+            yerr2=yerr2[ytmp > 0]
             ytmp=ytmp[ytmp > 0]
             if len(xtmp)  < 4:
-                xtmp = ytmp = yerr=0
+                xtmp = ytmp = yerr2=0
         #else:
         #    print("too small",torch.sum(x),self.nbins)
-        return iFit(xtmp,ytmp,yerr)
+        return iFit(xtmp,ytmp,yerr2)
 
     def xforward_fit(self, x, y, iFit):
-        xtmp = ytmp = yerr=0
+        xtmp = ytmp = yerr2=0
         xprime=x
         if self.round:
             xprime = torch.round(xprime)
         if torch.sum(x) > 0.1*self.nbins+4:#torch.round(x)) > 0.1*self.nbins+4:
             yhist,xbins=torch.histogram(y, self.BIN_Table,density=False,weight=xprime)#torch.round(x))
-            yerr=((torch.sqrt(yhist+self.delta_sys))/self.delta).detach().numpy()
-            ytmp=(yhist*1./self.delta).detach().numpy()
-            xtmp=self.h_r.detach().numpy()
+            yerr2=((yhist+self.delta_sys)/(self.delta**2)).detach()
+            ytmp=(yhist*1./self.delta).detach()
+            xtmp=self.h_r.detach()
             xtmp=xtmp[ytmp > 0]
-            yerr=yerr[ytmp > 0]
+            yerr2=yerr2[ytmp > 0]
             ytmp=ytmp[ytmp > 0]
             if len(xtmp)  < 4:
                 xtmp = ytmp = yerr=0
         #else:
         #    print("too small",torch.sum(x),self.nbins)
-        return iFit(xtmp,ytmp,yerr),ytmp,yerr
+        return iFit(xtmp,ytmp,yerr2),xtmp, ytmp,yerr2
 
     def forward_fit_diff(self, x, y, iFit):
         xtmp = ytmp = yerr=0
@@ -431,15 +361,15 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             wfac    = torch.sum(xprime)/torch.sum(1.-xprime)
             yhist2 *= wfac
             yhistd = yhist1-yhist2
-            yerr=(torch.sqrt(yhist1+yhist2*wfac)*1./self.delta).detach().numpy()
-            ytmp=(yhistd*1./self.delta).detach().numpy()
-            xtmp=self.h_r.detach().numpy()            
-        return iFit(xtmp,ytmp,yerr)
+            yerr2=((yhist1+yhist2*wfac)*1./(self.delta**2)).detach().numpy()
+            ytmp=(yhistd*1./self.delta).detach()
+            xtmp=self.h_r.detach()
+        return iFit(xtmp,ytmp,yerr2)
     
     def forward_sig(self, x, y):
         x_fit1,_,running_loss_fit1=self.forward_fit(x,y,self.fitPFunc.fitSig)
         x_fit2,_,running_loss_fit2=self.forward_fit(x,y,self.fitPFunc.fitBkg)
-        return running_loss_fit2-running_loss_fit1
+        return running_loss_fit2.detach().numpy()-running_loss_fit1.detach().numpy()
         #return np.maximum(running_loss_fit2-running_loss_fit1,0.)
 
     def check_data(self):#stupid check function
@@ -732,7 +662,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
                 loss = self.mass_deco*(loss+self.bkg_loss*loss_fail)
             return loss
 
-    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint_2_dpout.pth"):
+    def save_checkpoint(self, epoch, id, optimizer=None, path="checkpoint_2_dpout_pt.pth"):
         if optimizer is None:
             torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict()}, path)
         else:
@@ -740,7 +670,7 @@ class simple_MLPFit_lmfit(torch.nn.Module):
             #torch.save({"epoch": epoch,"id": id,"model_state_dict": self.model_disc[id].state_dict(),"optimizer_state_dict": self.opt[id].state_dict()}, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, id, optimizer = None, path="checkpoint_2_dpout.pth"):
+    def load_checkpoint(self, id, optimizer = None, path="checkpoint_2_dpout_pt.pth"):
         checkpoint = torch.load(path, map_location="cpu")
         self.model_disc[id].load_state_dict(checkpoint["model_state_dict"])
         self.opt[id].load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1049,12 +979,12 @@ def plotCheck(iModel,iOpt=1):
     result2.plot()
     plt.show()
 
-def prettyPlot(iresult,y,yerr,sig):
-    x = iresult.userkws['x']  # or however you pass x to the model
-    #y = iresult.userkws['y']  # observed data
-    y_fit = iresult.best_fit
-    residuals = (y - y_fit)/yerr
-    
+def prettyPlot(iFunc,iresult,x,y,yerr2,sig):
+    print(iresult.flatten())
+    pars = iresult.flatten()#.x.tolist()
+    y_fit = iFunc(x,pars)
+    residuals = (y - y_fit)/torch.sqrt(yerr2)
+    yerr=torch.sqrt(yerr2)
     fig, (ax_fit, ax_res) = plt.subplots(2, 1, figsize=(8,6), gridspec_kw={'height_ratios':[3,1]}, sharex=True)
 
     # --- Top panel: data + fit ---
@@ -1070,13 +1000,13 @@ def prettyPlot(iresult,y,yerr,sig):
 
     # --- Bottom panel: residuals ---
     ax_res.axhline(0, color='black', linestyle='--', linewidth=1)
-    ax_res.errorbar(x, residuals, yerr=yerr, fmt='o', color='#1f77b4', ecolor='#1f77b4', elinewidth=1.2,
+    ax_res.errorbar(x, residuals, yerr=yerr/yerr, fmt='o', color='#1f77b4', ecolor='#1f77b4', elinewidth=1.2,
                     capsize=3, label='Residuals')
     ax_res.set_xlabel("m$_{\gamma\gamma}$(GeV)", fontsize=14)
     ax_res.set_ylabel("Residual", fontsize=14)
     ax_res.grid(True, linestyle='--', alpha=0.6)
     ax_res.minorticks_on()
-    significance_text="Significance:"+(str(np.sqrt(sig))[:3])
+    significance_text="Significance:"+(str(np.sqrt(sig.detach().numpy()))[:3])
     ax_fit.text(0.02, 0.02, significance_text, transform=ax_fit.transAxes,
             fontsize=12, verticalalignment='bottom', horizontalalignment='left',
             bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
@@ -1111,25 +1041,24 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
     if iOpt == 0 or iOpt == 1:
         #print(output_disc,torch.round(output_disc))
         #xpars,result1,chi2=iModel.forward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)
-        (xpars,result1,chi2),y,yerr=iModel.xforward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)         
+        (xpars,result1,chi2),x,y,yerr2=iModel.xforward_fit(torch.round(output_disc),input,iModel.fitPFunc.fitSig)         
         sig=iModel.forward_sig(torch.round(output_disc),input.detach())
-        prettyPlot(result1,y,yerr,sig)
-        print(result1.fit_report())
-        result1.plot()
+        prettyPlot(iModel.fitPFunc.funcSig,xpars,x,y,yerr2,sig)
+        print(result1)
         
     elif iOpt == 2: 
         xpars,result1,chi2=iModel.forward_fit_diff(output_disc,input,iModel.fitPFunc.fitSig)
-        result1.plot()
+        #result1.plot()
     plt.show()
     print("Pass Significance:",iModel.forward_sig(output_disc,input.detach()))
 
     if iOpt ==1:
         #xpars,result2,chi2=iModel.forward_fit(torch.round(1.-output_disc),input,iModel.fitFFunc.fitSig)
-        (xpars,result2,chi2),y,yerr=iModel.xforward_fit(1.-output_disc,input,iModel.fitFFunc.fitSig)
+        (xpars,result2,chi2),x,y,yerr2=iModel.xforward_fit(1.-output_disc,input,iModel.fitFFunc.fitSig)
         #result2.plot()
         sig=iModel.forward_sig(1.-output_disc,input.detach())
-        prettyPlot(result2,y,yerr,sig)
-        print(result2.fit_report())
+        prettyPlot(iModel.fitPFunc.funcSig,xpars,x,y,yerr2,sig)
+        print(result2)
         print("Fail Significance:",iModel.forward_sig(1.-output_disc,input.detach()))
     plt.show()
  
@@ -1137,8 +1066,7 @@ def plotPerf(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1):
         input_bkg=iBkg[:,-1]
         input_sig=iSig[:,-1]
         #(xpars,result2,chi2),y,yerr=iModel.xforward_fit(1.-output_bkg_disc,input_bkg,iModel.fitPFunc.fitSig)
-        (xpars,result2,chi2),y,yerr=iModel.xforward_fit(output_sig_disc,input_sig,iModel.fitPFunc.fitSig)
-        result2.plot()
+        (xpars,result2,chi2),x,y,yerr2=iModel.xforward_fit(output_sig_disc,input_sig,iModel.fitPFunc.fitSig)
         print("Bkg Significance:",iModel.forward_sig(output_bkg_disc,input_bkg.detach()))
     plt.show()
 
@@ -1173,7 +1101,7 @@ def fisher_combine_zscores(zscores):
     zscores_fix=np.sqrt(zscores_fix)
     zscores_fix = np.array(zscores_fix)
     pvalues = 1 - norm.cdf(zscores_fix)
-    X = -2 * np.sum(np.log(pvalues))
+    X = -2 * torch.sum(np.log(pvalues))
     df = 2 * len(pvalues)
     p_combined = 1 - chi2.cdf(X, df)
     z_combined = norm.isf(p_combined)  # isf = inverse survival function = Φ⁻¹(1-p)
@@ -1229,10 +1157,10 @@ def plotPerfToys(iSig,iBkg, iModel,iOpt=1,iNS=-1,iNB=-1,iNToys=10,iLabel="spf_su
     bins=np.linspace(0,5,40)
     #plt.hist(np.maximum(lNSigs,0.),density=True,alpha=0.5,label='hh(bb+$\gamma\gamma$)',bins=bins)
     #plt.hist(np.maximum(lNBkgs,0.),density=True,alpha=0.5,label='bkg',bins=bins)
-    plt.hist(np.sqrt(np.maximum(lSigPs,0.)),density=True,alpha=0.5,label='hh(bb+$\gamma\gamma$)',bins=bins)
-    plt.hist(np.sqrt(np.maximum(lBkgPs,0.)),density=True,alpha=0.5,label='bkg',bins=bins)
+    plt.hist(torch.sqrt(torch.maximum(lSigPs,0.)),density=True,alpha=0.5,label='hh(bb+$\gamma\gamma$)',bins=bins)
+    plt.hist(torch.sqrt(torch.maximum(lBkgPs,0.)),density=True,alpha=0.5,label='bkg',bins=bins)
     plt.legend()
-    lNFalse=len(lNBkgs[lNBkgs > np.median(lNSigs)])
+    lNFalse=len(lNBkgs[lNBkgs > torch.median(lNSigs)])
     pvalue=lNFalse/iNToys
     print("Z-score:",norm.isf(pvalue),"p-value:",pvalue)
     plt.show()
@@ -1372,7 +1300,7 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
           pData   = DataSet(samples=tot,labels=label, disc=xdisc)
           iModel.reloadData(pData)
           try:
-            iModel.train(20,iLoad=True)
+            iModel.train(10,iLoad=True)
           except Exception as e:
             print("Fail 0")
             continue
@@ -1399,17 +1327,17 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
           lSBkgFs.append(lSBkgF)        
           
 
-          xoutput_disc = iModel.forward_disc(allvars[:,:-1].reshape(len(allvars),lN))
-          xobdisc      = iModel.forward_disc(allvars_bkg[:,:-1].reshape(len(lBRand),lN))
+          output_disc = iModel.forward_disc(allvars[:,:-1].reshape(len(allvars),lN))
+          obdisc      = iModel.forward_disc(allvars_bkg[:,:-1].reshape(len(lBRand),lN))
           #output_disc = torch.nan_to_num(output_disc, nan=0.0, posinf=0.0, neginf=0.0)
           #obdisc      = torch.nan_to_num(obdisc, nan=0.0, posinf=0.0, neginf=0.0)
           #plotPerf(allvars_sig,allvars_bkg,iModel)
           #Non-discretized
           try:
-            lSigP=iModel.forward_sig(xoutput_disc,mass.detach())
-            lSigF=iModel.forward_sig(1.-xoutput_disc,mass.detach())
-            lBSigP=iModel.forward_sig(xobdisc,mass_bkg.detach())
-            lBSigF=iModel.forward_sig(1.-xobdisc,mass_bkg.detach())
+            lSigP=iModel.forward_sig(output_disc,mass.detach())
+            lSigF=iModel.forward_sig(1.-output_disc,mass.detach())
+            lBSigP=iModel.forward_sig(obdisc,mass_bkg.detach())
+            lBSigF=iModel.forward_sig(1.-obdisc,mass_bkg.detach())
           except Exception as e:
             #plotPerf(allvars_sig,allvars_bkg,iModel)
             print("fail 1")
@@ -1430,8 +1358,8 @@ def trainToys(iSig,iBkg, iModel,iNS=-1,iNB=-1,iNToys=5,iLabel=""):
           lSigs.append(lSigT)
           lBkgs.append(lBSigT)
           #Non-discretized
-          doutput_disc = torch.round(xoutput_disc)
-          dobdisc      = torch.round(xobdisc)
+          doutput_disc = torch.round(output_disc)
+          dobdisc      = torch.round(obdisc)
           try:
             lDSigP=iModel.forward_sig(doutput_disc,mass.detach())
             lDSigF=iModel.forward_sig(1.-doutput_disc,mass.detach())
